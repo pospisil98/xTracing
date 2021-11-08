@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <vector>
 
+#include <string>
 #include <iostream>
 
 #if defined(__APPLE__)
@@ -19,6 +20,10 @@
 #include <GL/glu.h>
 #include <GL/glut.h>
 #endif
+
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 struct vec3;
 
@@ -81,6 +86,13 @@ int nTotalSamples = 1000; // samples in one render iteration - should be even nu
 // Compute random number in range [0,1], uniform distribution
 double drandom() { return (double)rand() / RAND_MAX; }
 
+template<typename T>
+T Clamp(T value, T lowerBound, T upperBound)
+{
+	if (value < lowerBound) return lowerBound;
+	else if (value > upperBound) return upperBound;
+	else return value;
+}
 
 // -------------------- VECTORS
 // Vector 3D
@@ -129,6 +141,64 @@ vec3 reflect(const vec3& N, const vec3& L)
 {
 	return  (N * (2.0 * dot(N, L))) - L;
 }
+// computes lumimance from RGB vector
+float lumimance(const vec3& V) {
+	return 0.2126 * V.x + 0.7152 * V.y + 0.0722 * V.z;
+}
+
+struct Distribution1D {
+	float *func, *cdf;
+	float funcInt, invFuncInt, invCount;
+	int count;
+
+	Distribution1D(float* f, int n) {
+		func = new float[n];
+		cdf = new float[n + 1];
+		count = n;
+		memcpy(func, f, n * sizeof(float));
+		ComputeStep1dCDF(func, n, &funcInt, cdf);
+		invFuncInt = 1.0f / funcInt;
+		invCount = 1.0f / count;
+	}
+
+	void ComputeStep1dCDF(float* f, int nSteps, float* c, float* cdf)
+	{
+		// Init first to 0 to be able to compute from it
+		cdf[0] = 0;
+
+		for (size_t i = 0; i < nSteps; i++) {
+			cdf[i] = cdf[i - 1] + f[i - 1] / nSteps;
+		}
+
+		// save sum
+		*c = cdf[nSteps];
+
+		// normalize
+		for (size_t i = 1; i < nSteps + 1; i++) {
+			cdf[i] = cdf[i] / *c;
+		}
+	}
+
+	float Sample(float u, float* pdf)
+	{
+		// std version of binary search of first element that is not less than value
+		float* ptr = std::lower_bound(cdf, cdf + count + 1, u);
+
+		// index of that pointer in array
+		int offset = (int)(ptr - cdf - 1);
+		
+		u = (u - cdf[offset]) / (cdf[offset + 1] - cdf[offset]);
+		
+		*pdf = func[offset] * invFuncInt;
+		
+		return offset + u;
+	}
+
+	~Distribution1D() {
+		delete[] func;
+		delete[] cdf;
+	}
+};
 
 
 // -------------------- MATERIALS
@@ -403,7 +473,6 @@ struct Sphere :
 	}
 };
 
-
 // -------------------- LIGHTS
 struct Light
 {
@@ -426,9 +495,93 @@ struct SphereLight
 	}
 };
 
-struct EnvironmentLight : Light
+struct InfiniteAreaLight : Light
 {
+	float* img;
+	float* luminanceImg;
+	int nu;
+	int nv;
 
+	Distribution1D* uDistrib;
+	Distribution1D** vDistribs;
+
+	InfiniteAreaLight()
+	{
+		int n;
+		img = stbi_loadf("./EM/raw001.hdr", &nu, &nv, &n, 0);
+
+		luminanceImg = new float[nu * nv];
+		RGBToLuminanceImage(img, nu, nv, luminanceImg);
+	}
+
+	~InfiniteAreaLight()
+	{
+		stbi_image_free(img);
+		delete[] luminanceImg;
+	}
+
+	void initPDFSample()
+	{
+		// calculate sin value for every row of image for later weighting
+		float* sinVals = (float*)alloca(nv * sizeof(float));
+		for (size_t i = 0; i < nv; i++) {
+			sinVals[i] = sin(M_PI * float(i + 0.5) / float(nv));
+		}
+
+		// Buffer for storing sin weighted luminance values
+		float* func = (float*)alloca(max(nu, nv) * sizeof(float));
+
+		vDistribs = new Distribution1D * [nu];
+
+		for (size_t u = 0; u < nu; u++) {
+			for (size_t v = 0; v < nv; v++) {
+				func[v] = img[u * nv + v] * sinVals[v];
+			}
+			vDistribs[u] = new Distribution1D(func, nv);
+		}
+
+		for (size_t u = 0; u < nu; u++) {
+			func[u] = vDistribs[u]->funcInt;
+		}
+
+		uDistrib = new Distribution1D(func, nu);
+	}
+
+	vec3 Sample(const vec3& p, float u1, float u2, vec3* wi, float* pdf)
+	{
+		float pdfs[2];
+		float fu = uDistrib->Sample(u1, &pdfs[0]);
+		int u = Clamp((int)fu, 0, uDistrib->count - 1);
+		float fv = vDistribs[u]->Sample(u2, &pdfs[1]);
+
+		float theta = fv * vDistribs[u]->invCount * M_PI;
+		float phi = fu * uDistrib->invCount * 2.0f * M_PI;
+
+		*wi = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+
+		*pdf = (pdfs[0] * pdfs[1]) / (2.0f * M_PI * M_PI * sin(theta));
+
+		float c1 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv)];
+		float c2 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv) + 1];
+		float c3 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv) + 2];
+
+		return vec3(c1, c2, c3);
+	}
+
+	void RGBToLuminanceImage(float* image, int width, int height, float* output)
+	{
+		for (size_t y = 0; y < height; y++) {
+			for (size_t x = 0; x < width; x++) {
+				vec3 v;
+				v.x = image[y * width * 3 + x];
+				v.y = image[y * width * 3 + x + 1];
+				v.y = image[y * width * 3 + x + 2];
+
+				float l = lumimance(v);
+				output[y * width + x] = l;
+			}
+		}
+	}
 };
 
 const int screenWidth = 600;
@@ -518,18 +671,18 @@ public:
 		FILE* errorFile = 0;
 
 		switch (method) {
-		case BRDF:
-			nBRDFSamples = nTotalSamples;
-			nLightSamples = 0;
-			errorFile = fopen("BRDF.txt", "w");
-			setWeight(0.0);
-			break;
-		case LIGHT_SOURCE:
-			nBRDFSamples = 0;
-			nLightSamples = nTotalSamples;
-			errorFile = fopen("light.txt", "w");
-			setWeight(1.0);
-			break;
+			case BRDF:
+				nBRDFSamples = nTotalSamples;
+				nLightSamples = 0;
+				errorFile = fopen("BRDF.txt", "w");
+				setWeight(0.0);
+				break;
+			case LIGHT_SOURCE:
+				nBRDFSamples = 0;
+				nLightSamples = nTotalSamples;
+				errorFile = fopen("light.txt", "w");
+				setWeight(1.0);
+				break;
 		} // switch
 
 		double cost = 0;
@@ -891,6 +1044,12 @@ onKeyboard(unsigned char key, int x, int y)
 {
 	switch (key) {
 		printf("%c", key);
+	case 'h':
+	{
+		printf("Try to load HDR image\n");
+		
+		break;
+	}
 	case 'l':
 		method = LIGHT_SOURCE;
 		printf("Light source sampling\n");
