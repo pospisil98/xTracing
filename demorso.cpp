@@ -25,6 +25,10 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 struct vec3;
 
 // Pseudocolor mapping of a scalar value
@@ -142,21 +146,37 @@ vec3 reflect(const vec3& N, const vec3& L)
 	return  (N * (2.0 * dot(N, L))) - L;
 }
 // computes lumimance from RGB vector
-float lumimance(const vec3& V) {
-	return 0.2126 * V.x + 0.7152 * V.y + 0.0722 * V.z;
+float lumimance(const float r, const float g, const float b)
+{
+	return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
 
-struct Distribution1D {
-	float *func, *cdf;
+// return theta (spherical coords) from some vector 
+float SphericalTheta(const vec3& v) { return acosf(Clamp((float)v.z, -1.f, 1.f)); }
+// return phi (spherical coords) from some vector 
+float SphericalPhi(const vec3& v) {
+	float p = atan2f(v.y, v.x);
+	return (p < 0.f) ? p + 2.f * M_PI : p;
+}
+
+struct Distribution1D
+{
+	float* func;
+	float* cdf;
+
 	float funcInt, invFuncInt, invCount;
+
 	int count;
 
-	Distribution1D(float* f, int n) {
+	Distribution1D(float* f, int n)
+	{
 		func = new float[n];
 		cdf = new float[n + 1];
 		count = n;
 		memcpy(func, f, n * sizeof(float));
+
 		ComputeStep1dCDF(func, n, &funcInt, cdf);
+		
 		invFuncInt = 1.0f / funcInt;
 		invCount = 1.0f / count;
 	}
@@ -166,7 +186,7 @@ struct Distribution1D {
 		// Init first to 0 to be able to compute from it
 		cdf[0] = 0;
 
-		for (size_t i = 0; i < nSteps; i++) {
+		for (int i = 1; i < nSteps + 1; i++) {
 			cdf[i] = cdf[i - 1] + f[i - 1] / nSteps;
 		}
 
@@ -174,7 +194,7 @@ struct Distribution1D {
 		*c = cdf[nSteps];
 
 		// normalize
-		for (size_t i = 1; i < nSteps + 1; i++) {
+		for (int i = 0; i < nSteps + 1; i++) {
 			cdf[i] = cdf[i] / *c;
 		}
 	}
@@ -186,15 +206,15 @@ struct Distribution1D {
 
 		// index of that pointer in array
 		int offset = (int)(ptr - cdf - 1);
-		
+
 		u = (u - cdf[offset]) / (cdf[offset + 1] - cdf[offset]);
-		
 		*pdf = func[offset] * invFuncInt;
-		
+
 		return offset + u;
 	}
 
-	~Distribution1D() {
+	~Distribution1D()
+	{
 		delete[] func;
 		delete[] cdf;
 	}
@@ -476,22 +496,20 @@ struct Sphere :
 // -------------------- LIGHTS
 struct Light
 {
-	// get sample
 
-	// get color at sample position
-
-	// probability of sample
 };
 
 // The light source represented by a sphere
-struct SphereLight
+struct SphereLight : Light
 {
 	Sphere* sphere;
 	vec3 point;
 	vec3 normal;
-	SphereLight(Sphere* _sphere, vec3 _point, vec3 _normal)
-	{
-		sphere = _sphere, point = _point; normal = _normal;
+
+	SphereLight(Sphere* _sphere, vec3 _point, vec3 _normal) {
+		sphere = _sphere;
+		point = _point;
+		normal = _normal;
 	}
 };
 
@@ -501,17 +519,44 @@ struct InfiniteAreaLight : Light
 	float* luminanceImg;
 	int nu;
 	int nv;
+	int n;
+
+	vec3 point;
 
 	Distribution1D* uDistrib;
 	Distribution1D** vDistribs;
 
-	InfiniteAreaLight()
+	InfiniteAreaLight(const char* path)
 	{
-		int n;
-		img = stbi_loadf("./EM/raw001.hdr", &nu, &nv, &n, 0);
+		//stbi_ldr_to_hdr_gamma(1.0f);
+		img = stbi_loadf(path, &nu, &nv, &n, 0);
 
 		luminanceImg = new float[nu * nv];
 		RGBToLuminanceImage(img, nu, nv, luminanceImg);
+
+		// calculate sin value for every row of image for later weighting
+		float* sinVals = new float[nv * sizeof(float)];
+		for (int i = 0; i < nv; i++) {
+			sinVals[i] = sinf(M_PI * float(i + 0.5f) / float(nv));
+		}
+
+		// Buffer for storing sin weighted luminance values
+		float* func = new float[max(nu, nv)];
+
+		vDistribs = new Distribution1D * [nu];
+
+		for (int u = 0; u < nu; ++u) {
+			for (int v = 0; v < nv; ++v) {		
+				func[v] = luminanceImg[v * nu + u] * sinVals[v];
+			}
+			vDistribs[u] = new Distribution1D(func, nv);
+		}
+
+		for (int u = 0; u < nu; ++u) {
+			func[u] = vDistribs[u]->funcInt;
+		}
+
+		uDistrib = new Distribution1D(func, nu);
 	}
 
 	~InfiniteAreaLight()
@@ -520,46 +565,33 @@ struct InfiniteAreaLight : Light
 		delete[] luminanceImg;
 	}
 
-	void initPDFSample()
+	// get sample 
+
+	// get RGB from direction
+
+	// probability of sample
+
+
+	vec3 Sample(vec3* wi, float* pdf, float* uOpt, float* vOpt)
 	{
-		// calculate sin value for every row of image for later weighting
-		float* sinVals = (float*)alloca(nv * sizeof(float));
-		for (size_t i = 0; i < nv; i++) {
-			sinVals[i] = sin(M_PI * float(i + 0.5) / float(nv));
-		}
+		float u1 = drandom();
+		float u2 = drandom();
 
-		// Buffer for storing sin weighted luminance values
-		float* func = (float*)alloca(max(nu, nv) * sizeof(float));
-
-		vDistribs = new Distribution1D * [nu];
-
-		for (size_t u = 0; u < nu; u++) {
-			for (size_t v = 0; v < nv; v++) {
-				func[v] = img[u * nv + v] * sinVals[v];
-			}
-			vDistribs[u] = new Distribution1D(func, nv);
-		}
-
-		for (size_t u = 0; u < nu; u++) {
-			func[u] = vDistribs[u]->funcInt;
-		}
-
-		uDistrib = new Distribution1D(func, nu);
-	}
-
-	vec3 Sample(const vec3& p, float u1, float u2, vec3* wi, float* pdf)
-	{
 		float pdfs[2];
+
 		float fu = uDistrib->Sample(u1, &pdfs[0]);
 		int u = Clamp((int)fu, 0, uDistrib->count - 1);
 		float fv = vDistribs[u]->Sample(u2, &pdfs[1]);
+
+		*uOpt = fu / uDistrib->count;
+		*vOpt = fv / vDistribs[u]->count;
 
 		float theta = fv * vDistribs[u]->invCount * M_PI;
 		float phi = fu * uDistrib->invCount * 2.0f * M_PI;
 
 		*wi = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
 
-		*pdf = (pdfs[0] * pdfs[1]) / (2.0f * M_PI * M_PI * sin(theta));
+		*pdf = (pdfs[0] * pdfs[1]) / (2.0f * M_PI * M_PI * sinf(theta));
 
 		float c1 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv)];
 		float c2 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv) + 1];
@@ -568,17 +600,31 @@ struct InfiniteAreaLight : Light
 		return vec3(c1, c2, c3);
 	}
 
-	void RGBToLuminanceImage(float* image, int width, int height, float* output)
-	{
-		for (size_t y = 0; y < height; y++) {
-			for (size_t x = 0; x < width; x++) {
-				vec3 v;
-				v.x = image[y * width * 3 + x];
-				v.y = image[y * width * 3 + x + 1];
-				v.y = image[y * width * 3 + x + 2];
+	float pdf(const vec3& point, const vec3& wi) {
+		float theta = SphericalTheta(wi);
+		float phi = SphericalPhi(wi);
 
-				float l = lumimance(v);
-				output[y * width + x] = l;
+		int u = Clamp((int)(phi * (1 / (2 * M_PI) * uDistrib->count)), 0, uDistrib->count - 1);
+		int v = Clamp((int)(theta * (1/M_PI) * vDistribs[u]->count), 0, vDistribs[u]->count - 1);
+
+		return (uDistrib->func[u] * vDistribs[u]->func[v]) /
+			(uDistrib->funcInt * vDistribs[u]->funcInt) *
+			(1.0f / 2.0f * M_PI * M_PI * sin(theta));
+	}
+
+	void RGBToLuminanceImage(float* image, int nu, int nv, float* output)
+	{
+		for (int u = 0; u < nu; u++) {
+			for (int v = 0; v < nv; v++) {
+				int index = v * nu + u;
+
+				float r = img[index * 3] * 255;
+				float g = img[index * 3 + 1] * 255;
+				float b = img[index * 3 + 2] * 255;
+
+				float l = lumimance(r, g, b) / 256;
+
+				output[index] = l;
 			}
 		}
 	}
@@ -671,18 +717,18 @@ public:
 		FILE* errorFile = 0;
 
 		switch (method) {
-			case BRDF:
-				nBRDFSamples = nTotalSamples;
-				nLightSamples = 0;
-				errorFile = fopen("BRDF.txt", "w");
-				setWeight(0.0);
-				break;
-			case LIGHT_SOURCE:
-				nBRDFSamples = 0;
-				nLightSamples = nTotalSamples;
-				errorFile = fopen("light.txt", "w");
-				setWeight(1.0);
-				break;
+		case BRDF:
+			nBRDFSamples = nTotalSamples;
+			nLightSamples = 0;
+			errorFile = fopen("BRDF.txt", "w");
+			setWeight(0.0);
+			break;
+		case LIGHT_SOURCE:
+			nBRDFSamples = 0;
+			nLightSamples = nTotalSamples;
+			errorFile = fopen("light.txt", "w");
+			setWeight(1.0);
+			break;
 		} // switch
 
 		double cost = 0;
@@ -790,16 +836,14 @@ public:
 			double random = drandom();
 			if (cosThetaLight > epsilon) {
 				// visibility is not needed to handle, all lights are visible
-				double pdfLightSourceSampling =
-					lightSample.sphere->pointSampleProb(totalPower) * distance2 / cosThetaLight;
+				double pdfLightSourceSampling = lightSample.sphere->pointSampleProb(totalPower) * distance2 / cosThetaLight;
 				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
 				// the theta angle on the surface between normal and light direction
 				double cosThetaSurface = dot(hit.normal, outDir);
 				if (cosThetaSurface > 0) {
 					// yes, the light is visible and contributes to the output power
 					// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
-					vec3 f = lightSample.sphere->material->Le *
-						hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
+					vec3 f = lightSample.sphere->material->Le * hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
 					double p = pdfLightSourceSampling;
 					// importance sample = 1/n . \sum (f/prob)
 					radianceLightSourceSampling += f / p / nTotalSamples;
@@ -856,8 +900,7 @@ Scene scene;
 
 
 
-void
-onInitialization()
+void onInitialization()
 {
 	for (int Y = 0; Y < screenHeight; Y++) {
 		for (int X = 0; X < screenWidth; X++) {
@@ -882,9 +925,7 @@ onInitialization()
 	method = LIGHT_SOURCE; // the method to compute an image
 }
 
-void
-getPseudocolorRainbow(double val, double minVal, double maxVal,
-	double& r, double& g, double& b)
+ void getPseudocolorRainbow(double val, double minVal, double maxVal, double& r, double& g, double& b)
 {
 	if (isnan(val) || isinf(val)) {
 		r = g = b = 0; // black ... exception
@@ -906,9 +947,7 @@ getPseudocolorRainbow(double val, double minVal, double maxVal,
 	return;
 }
 
-void
-getPseudocolorCoolWarm(double val, double minVal, double maxVal,
-	double& r, double& g, double& b)
+void getPseudocolorCoolWarm(double val, double minVal, double maxVal, double& r, double& g, double& b)
 {
 	if (isnan(val) || isinf(val)) {
 		r = g = b = 0; // black ... exception
@@ -926,8 +965,7 @@ getPseudocolorCoolWarm(double val, double minVal, double maxVal,
 	//printf("rgb=%f %f %f index=%d a=%g\n",r,g,b,i, alpha);
 }
 
-void
-onDisplay()
+void onDisplay()
 {
 	glClearColor(0.1f, 0.2f, 0.3f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -1030,8 +1068,7 @@ void Usage()
 }
 
 // Mouse click event
-void
-onMouse(int button, int state, int pX, int pY)
+void onMouse(int button, int state, int pX, int pY)
 {
 	if (button == GLUT_LEFT_BUTTON && state == GLUT_DOWN) {
 		// select GLUT_LEFT_BUTTON / GLUT_RIGHT_BUTTON and GLUT_DOWN / GLUT_UP
@@ -1039,15 +1076,38 @@ onMouse(int button, int state, int pX, int pY)
 	}
 }
 
-void
-onKeyboard(unsigned char key, int x, int y)
+void onKeyboard(unsigned char key, int x, int y)
 {
 	switch (key) {
 		printf("%c", key);
 	case 'h':
 	{
 		printf("Try to load HDR image\n");
-		
+
+	
+		InfiniteAreaLight light = InfiniteAreaLight("./EM/raw024.hdr");
+		vec3 wi; float pdf;
+		float u;
+		float v;
+
+		for (int i = 0; i < 50000; i++) {
+			// generate point in map according to samplin
+			vec3 pos = light.Sample(&wi, &pdf, &u, &v);
+			
+			// make pixel there red
+			int index = int((light.nv - 1) * v) * light.nu + int((light.nu - 1) * u);
+			light.img[index * 3] = 1.0f;
+			light.img[index * 3 + 1] = 0.0f;
+			light.img[index * 3 + 2] = 0.0f;
+		}
+
+		// save HDR map
+		stbi_write_hdr("swag.hdr", light.nu, light.nv, 3, light.img);
+
+
+		stbi_write_hdr("swagLumi.hdr", light.nu, light.nv, 1, light.luminanceImg);
+
+
 		break;
 	}
 	case 'l':
@@ -1140,8 +1200,7 @@ onKeyboard(unsigned char key, int x, int y)
 	glutPostRedisplay();
 }
 
-int
-main(int argc, char** argv)
+int main(int argc, char** argv)
 {
 	glutInit(&argc, argv);
 	glutInitWindowSize(2 * screenWidth, screenHeight);
