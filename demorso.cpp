@@ -498,11 +498,16 @@ struct Sphere :
 // -------------------- LIGHTS
 struct Light
 {
+	vec3 normal;
+
 	// get sample 
-
-	// get RGB from direction
-
+	virtual vec3 sampleLight(const vec3& point, vec3* wi, float* pdf) = 0;
+	 
 	// probability of sample
+	virtual float sampleProbability(const vec3& point, const vec3& wi, float totalPower) = 0;
+	
+	// get ilumination at dir
+	virtual vec3 getIlumination(vec3 dir) = 0;
 };
 
 // The light source represented by a sphere
@@ -510,12 +515,23 @@ struct SphereLight : Light
 {
 	Sphere* sphere;
 	vec3 point;
-	vec3 normal;
 
 	SphereLight(Sphere* _sphere, vec3 _point, vec3 _normal) {
 		sphere = _sphere;
 		point = _point;
 		normal = _normal;
+	}
+
+	vec3 sampleLight(const vec3& point, vec3* wi, float* pdf) {
+		return sphere->material->Le;
+	}
+
+	float sampleProbability(const vec3& point, const vec3& wi, float totalPower) {
+		return sphere->pointSampleProb(totalPower);
+	}
+
+	vec3 getIlumination(vec3 dir) {
+		return sphere->material->Le;
 	}
 };
 
@@ -570,6 +586,19 @@ struct InfiniteAreaLight : Light
 		stbi_image_free(img);
 		delete[] luminanceImg;
 	}
+
+	vec3 sampleLight(const vec3& point, vec3* wi, float* pdf) {
+		return Sample(wi, pdf, 0, 0);
+	}
+
+	float sampleProbability(const vec3& point, const vec3& wi, float totalPower) {
+		return pdf(point, wi);
+	}
+
+	vec3 getIlumination(vec3 dir) {
+		return vec3(0, 0, 0);
+	}
+
 
 	vec3 Sample(vec3* wi, float* pdf, float* uOpt, float* vOpt)
 	{
@@ -638,22 +667,22 @@ struct InfiniteAreaLight : Light
 		//printf("%f %f\n", u, v);
 
 		int index = v * nu + u;
-		
+
+		float r, g, b;
+		r = g = b = 0;
+
 		bool debug = false;
 		if (debug) {
 			img[index * 3] = 1;
 			img[index * 3 + 1] = 0;
 			img[index * 3 + 2] = 0;
 		} else {
-			float r, g, b;
 			r = img[index * 3];
 			g = img[index * 3 + 1];
 			b = img[index * 3 + 2];
-
-			return vec3(r, g, b);
 		}
 
-		return vec3(0, 0, 0);
+		return vec3(r, g, b);
 	}
 };
 
@@ -699,7 +728,7 @@ class Scene
 	int nLightSamples, nBRDFSamples;
 public:
 	Camera camera;
-	InfiniteAreaLight envMap = InfiniteAreaLight("./EM/raw023.hdr");
+	InfiniteAreaLight envMap = InfiniteAreaLight("./EM/raw023.hdr");;
 
 	void build()
 	{
@@ -766,21 +795,21 @@ public:
 		for (int iIter = 1; iIter <= nIterations; iIter++) {
 			double error = 0;
 			for (int Y = 0; Y < screenHeight; Y++) { // for all rows
-				printf("%d\r", Y);
 
-				#pragma omp parallel for
+				//#pragma omp parallel for
 				for (int X = 0; X < screenWidth; X++) { // for all pixels in a row
-					//if (debug) { // debug particular pixel x,y, coordinates from pfsv (pfstools)
-					//	X = 441;
-					//	Y = screenHeight - 529;
-					//}
+					/*if (debug) { // debug particular pixel x,y, coordinates from pfsv (pfstools)
+						X = 441;
+						Y = screenHeight - 529;
+					}*/
 
 					nLightSamples = (int)(weight[Y * screenWidth + X] * nTotalSamples + 0.5);
 					nBRDFSamples = nTotalSamples - nLightSamples;
 					cost += nBRDFSamples * costBRDF + nLightSamples * costLight;
 
 					// For a primary ray at pixel (X,Y) compute the color
-					vec3 color = trace(camera.getRay(X, Y));
+					//vec3 color = trace(camera.getRay(X, Y));
+					vec3 color = trace2(camera.getRay(X, Y));
 					double w = 1.0 / iIter; // the same weight for all samples for computing mean incrementally
 					image[Y * screenWidth + X] = color * w + image[Y * screenWidth + X] * (1.0 - w);
 
@@ -815,7 +844,7 @@ public:
 	}
 
 	// Sample the light source from all the light sources in the scene
-	SphereLight sampleLightSource(const vec3& illuminatedPoint) // the 3D point on an object
+	SphereLight* sampleLightSource(const vec3& illuminatedPoint) // the 3D point on an object
 	{
 		while (true) { // if no light source is selected due to floating point inaccuracies, repeat
 			double threshold = totalPower * drandom();
@@ -827,11 +856,129 @@ public:
 					vec3 point, normal;
 					// select a point on the visible half of the light source
 					((Sphere*)objects[i])->sampleUniformPoint(illuminatedPoint, point, normal);
-					return SphereLight(sphere, point, normal);
+					return new SphereLight(sphere, point, normal);
 				} // if
 			} // for i
 		} // for ever
 	}
+
+	Light& sampleLight(vec3& point, vec3& direction) {
+		if (method == LIGHT_SOURCE) {
+			SphereLight* lightSample = sampleLightSource(point); // generate a light sample
+
+			vec3 outDir = lightSample->point - point; // compute direction towards sample
+
+			direction = outDir;
+
+			return *lightSample;
+		} else {
+			// return env map
+			envMap.sampleLight(point, &direction, 0);
+			return envMap;
+		}
+	}
+
+	vec3 trace2(const Ray& r)
+	{
+		// error measures for the two combined techniques: used for adaptation
+		Hit hit = firstIntersect(r, NULL);	// find visible point
+		if (hit.t < 0) {
+			if (method == LIGHT_SOURCE_ENV) {
+				return envMap.sampleMapFromDirection(r.dir);
+			}
+			else {
+				return vec3(0, 0, 0);
+			}
+		}
+
+		// The energy emanated from the material
+		vec3 radianceEmitted = hit.material->Le;
+
+		if (hit.material->diffuseAlbedo.average() < epsilon && hit.material->specularAlbedo.average() < epsilon) {
+			return radianceEmitted; // if albedo is low, no energy can be reefleted
+		}
+
+		// Compute the contribution of reflected lgiht
+		vec3 radianceBRDFSampling(0, 0, 0);
+		vec3 radianceLightSourceSampling(0, 0, 0);
+		vec3 inDir = r.dir * (-1);	// incident direction
+
+		int nTotalSamples = (nLightSamples + nBRDFSamples);
+		double alpha = (double)nLightSamples / nTotalSamples;
+
+		// The direct illumination for chosen number of samples
+		for (int i = 0; i < nLightSamples; i++) {
+			vec3 outDir = vec3(0, 0, 0);
+			Light& lightSample = sampleLight(hit.position, outDir);
+
+			double distance2 = dot(outDir, outDir);
+
+			if (sqrt(distance2) < epsilon) {
+				continue;
+			}
+
+			outDir = outDir.normalize();
+
+			double cosThetaLight = dot(lightSample.normal, outDir * (-1));
+			double random = drandom();
+
+			if (cosThetaLight > epsilon) {
+				// visibility is not needed to handle, all lights are visible
+				double pdfLightSourceSampling = lightSample.sampleProbability(hit.position, outDir, totalPower) * distance2 / cosThetaLight;
+				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
+
+				// the theta angle on the surface between normal and light direction
+				double cosThetaSurface = dot(hit.normal, outDir);
+				if (cosThetaSurface > 0) {
+					// yes, the light is visible and contributes to the output power
+					// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
+					vec3 f = lightSample.getIlumination(outDir) * hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
+					double p = pdfLightSourceSampling;
+					// importance sample = 1/n . \sum (f/prob)
+					radianceLightSourceSampling += f / p / nTotalSamples;
+				} // if
+			}
+		} // for all the samples from light
+
+		// The contribution from importance sampling BRDF.cos(theta)
+		for (int i = 0; i < nBRDFSamples; i++) {
+			// BRDF.cos(theta) sampling should be implemented first!
+			vec3 outDir;
+
+			// BRDF sampling with Russian roulette
+			if (hit.material->sampleDirection(hit.normal, inDir, outDir)) {
+				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
+				double cosThetaSurface = dot(hit.normal, outDir);
+
+				if (cosThetaSurface > 0) {
+					vec3 brdf = hit.material->BRDF(hit.normal, inDir, outDir);
+
+					// Trace a ray to the scene
+					Hit lightSource = firstIntersect(Ray(hit.position, outDir), hit.object);
+
+					// Do we hit a light source
+					if (lightSource.t > 0 && lightSource.material->Le.average() > 0) {
+						// squared distance between an illuminated point and light source
+						double distance2 = lightSource.t * lightSource.t;
+						double cosThetaLight = dot(lightSource.normal, outDir * (-1));
+
+						if (cosThetaLight > epsilon) {
+							double pdfLightSourceSampling = lightSource.object->pointSampleProb(totalPower) * distance2 / cosThetaLight;
+
+							// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
+							vec3 f = lightSource.material->Le * brdf * cosThetaSurface;
+							double p = pdfBRDFSampling;
+							radianceBRDFSampling += f / p / nTotalSamples;
+						}
+						else
+							printf("ERROR: Sphere hit from back\n");
+					}
+				}
+			}
+		} // for i
+		return radianceEmitted + radianceLightSourceSampling + radianceBRDFSampling;
+	}
+
 
 	// Trace a primary ray towards the scene
 	vec3 trace(const Ray& r)
@@ -840,7 +987,6 @@ public:
 		Hit hit = firstIntersect(r, NULL);	// find visible point
 		if (hit.t < 0) {
 			if (method == LIGHT_SOURCE_ENV) {
-				// TODO: when env map in use - sample color from there
 				return envMap.sampleMapFromDirection(r.dir);
 			} else {
 				return vec3(0, 0, 0);
@@ -864,8 +1010,8 @@ public:
 
 		// The direct illumination for chosen number of samples
 		for (int i = 0; i < nLightSamples; i++) {
-			SphereLight lightSample = sampleLightSource(hit.position); // generate a light sample
-			
+			SphereLight lightSample = *sampleLightSource(hit.position); // generate a light sample
+
 			vec3 outDir = lightSample.point - hit.position; // compute direction towards sample
 			
 			double distance2 = dot(outDir, outDir);
@@ -947,8 +1093,6 @@ public:
 
 // Global variable
 Scene scene;
-
-
 
 void onInitialization()
 {
