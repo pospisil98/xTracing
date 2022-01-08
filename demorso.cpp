@@ -88,6 +88,13 @@ double costBRDF = 1.0, costLight = 1.0, referenceEfficiency = 1.0;
 int nIterations = 1; // how many iterations to render
 int nTotalSamples = 128; // samples in one render iteration - should be even number
 
+int PT_MAX_DEPTH = 50; // max path tracing depth - should not be used because of russian roulette
+
+// fast and ugly way of deciding which reflection happened
+int REFL_DIFFUSE = 1;
+int REFL_SPEC = 2;
+int REFL_TYPE_PLACEHOLDER;
+
 // Compute random number in range [0,1], uniform distribution
 double drandom() { return (double)rand() / RAND_MAX; }
 
@@ -234,6 +241,7 @@ struct Material
 	double  shininess;
 
 	Material() {
+		Le = vec3(0.0, 0.0, 0.0);
 		shininess = 0;
 	}
 
@@ -261,17 +269,14 @@ struct Material
 	}
 
 	// BRDF.cos(theta) importance sampling for input normal, outgoing direction
-	bool sampleDirection(const vec3& N, const vec3& V, vec3& L)
+	bool sampleDirection(const vec3& N, const vec3& V, vec3& L, int& type)
 	{ // output - the incoming light direction
 		L = vec3(0, 0, 0);
 
+		// TODO: change to only two randoms
 		const double randomType = drandom();
 		const double um = drandom();
 		const double vm = drandom();
-
-		// only two randoms
-		// prvni random musime podelit tim rozsahem abchom zas edostali 0-1
-		// popripade podelit tim mezi koncem diffuse a koncem specular
 
 		vec3 koeffs;
 		if (randomType < diffuseAlbedo.average()) {
@@ -284,7 +289,6 @@ struct Material
 
 			const vec3 w = vec3(2.0 * drandom() - 1.0, 2.0 * drandom() - 1.0, 2.0 * drandom() - 1.0).normalize();
 			vec3 k = N.normalize();
-			// TODO: opatrne na ten vector (1, 0, 0) muze byt stejny jako N a muze to bejt spatny
 			vec3 i = cross(N, w).normalize();
 			vec3 j = cross(i, k).normalize();
 
@@ -293,6 +297,7 @@ struct Material
 			if (dot(N, Lm) < 0)
 				return false;
 
+			type = REFL_DIFFUSE;
 			L = Lm;
 		} else if (randomType < (diffuseAlbedo.average() + specularAlbedo.average())) {
 			const double alpham = acos(pow(um, 1 / (shininess + 1)));
@@ -313,6 +318,7 @@ struct Material
 			if (dot(N, Lm) < 0)
 				return false;
 
+			type = REFL_SPEC;
 			L = Lm;
 		} else {
 			return false;
@@ -325,10 +331,8 @@ struct Material
 	double sampleProb(const vec3& N, const vec3& V, const vec3& L)
 	{
 		double p = 0.0;
-
 		p += diffuseAlbedo.average() * max(0.0, dot(L, N)) / M_PI;
 		p += specularAlbedo.average() * ((shininess + 1.0) / (2.0 * M_PI)) * pow(max(0.0, dot(V, reflect(N, L))), shininess);
-
 		return p;
 	}
 };
@@ -345,10 +349,19 @@ struct TableMaterial : Material
 	TableMaterial(double shine)
 	{
 		shininess = shine;
-		//diffuseAlbedo = vec3(0.8, 0.8, 0.8);
-		diffuseAlbedo = vec3(0.5, 0.5, 0.5);
-		specularAlbedo = vec3(0.5, 0.5, 0.5);
-		//specularAlbedo = vec3(0.05, 0.05, 0.05);
+		// or both at .5
+		diffuseAlbedo = vec3(0.8, 0.8, 0.8);
+		specularAlbedo = vec3(0.05, 0.05, 0.05);
+	}
+};
+
+struct GeneralMaterial : Material
+{
+	GeneralMaterial(double shine, vec3 color, float diffuseConst, float specularConst)
+	{
+		shininess = shine;
+		diffuseAlbedo = color * diffuseConst;
+		specularAlbedo = color * specularConst;
 	}
 };
 
@@ -387,8 +400,7 @@ struct Intersectable
 };
 
 // Rectangle 2D in 3D space
-class Rect :
-	public Intersectable
+class Rect : public Intersectable
 {
 	// anchor point, normal, 
 	vec3 r0, normal, right, forward;
@@ -435,8 +447,7 @@ public:
 };
 
 // Sphere used as light source
-struct Sphere :
-	public Intersectable
+struct Sphere : public Intersectable
 {
 	vec3 center;
 	double  radius;
@@ -447,7 +458,11 @@ struct Sphere :
 		center = cent; radius = rad;
 		material = mat;
 		power = material->Le.average() * (4 * radius * radius * M_PI) * M_PI;
-		material->Le = material->Le * (targetPower / power);
+
+		if (power > 0.0f) {
+			material->Le = material->Le * (targetPower / power);
+		}
+
 		power = targetPower;
 	}
 
@@ -604,7 +619,6 @@ struct InfiniteAreaLight : Light
 
 	vec3 getIlumination(vec3 dir) {
 		return sampleMapFromDirection(dir, vec3(1, 0, 0));
-		//return vec3(0.0, 0.0, 0.0);
 	}
 
 
@@ -619,24 +633,19 @@ struct InfiniteAreaLight : Light
 		int u = Clamp((int)fu, 0, uDistrib->count - 1);
 		float fv = vDistribs[u]->Sample(u2, &pdfs[1]);
 
-	
-		//*uOpt = fu / uDistrib->count;
-		//*vOpt = fv / vDistribs[u]->count;
 
 		float theta = fv * vDistribs[u]->invCount * M_PI;
 		float phi = fu * uDistrib->invCount * 2.0f * M_PI + M_PI / 2.0f;
 
 		*wi = vec3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
-		// TABULE
-		//*wi = vec3(sin(theta) * sin(phi), sin(theta) * cos(phi), cos(theta));
 
 		normal = ( * wi * (-1.0f)).normalize();
 
 		*pdf = (pdfs[0] * pdfs[1]) / (2.0f * M_PI * M_PI * sinf(theta));
 		if (sin(theta) == 0.0f) *pdf = 0.0f;
 		
+		// TODO: fix - but not used
 		float c1, c2, c3;
-		// spatne ale nepouziva se to
 		c1 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv)];
 		c2 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv) + 1];
 		c3 = img[(int)(fu * uDistrib->invCount) + (int)(fv * vDistribs[u]->invCount * nv) + 2];
@@ -757,7 +766,7 @@ public:
 };
 
 // Which sampling method should be used
-enum Method { BRDF, LIGHT_SOURCE, LIGHT_SOURCE_ENV, NAIVE } method;
+enum Method { BRDF, BRDF_ENV, LIGHT_SOURCE, LIGHT_SOURCE_ENV, NAIVE , MIS, PATH_TRACING } method;
 
 // The scene definition with main rendering method
 class Scene
@@ -767,10 +776,7 @@ class Scene
 	int nLightSamples, nBRDFSamples;
 public:
 	Camera camera;
-	//InfiniteAreaLight envMap = InfiniteAreaLight("./EM/raw023.hdr");;
-	//InfiniteAreaLight envMap = InfiniteAreaLight("./EM/rotated/raw004.hdr");;
-	InfiniteAreaLight envMap = InfiniteAreaLight("./EM/rotated/raw013.hdr");;
-	//InfiniteAreaLight envMap = InfiniteAreaLight("./debugEnv.hdr");;
+	InfiniteAreaLight envMap = InfiniteAreaLight("./EM/rotated/raw013.hdr");
 
 	void build()
 	{
@@ -778,33 +784,49 @@ public:
 		vec3 eyePos(0, 6, 18); // camera center
 		vec3 lightCenterPos(0, 4, -6); // first light source
 
-		// Create geometry - 4 rectangles
-		bool sameShininies = false;
-		if (sameShininies == true) {
-			objects.push_back(new Rect(vec3(0, -4, +2), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
-			objects.push_back(new Rect(vec3(0, -3.5, -2), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
-			objects.push_back(new Rect(vec3(0, -2.5, -6), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
-			objects.push_back(new Rect(vec3(0, -1, -10), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
+		bool PT_scene = true;
+		if (PT_scene) {
+			objects.push_back(new Rect(vec3(0, -2.5, 0), vec3(0,1,0), vec3(0,1,0), 7, 7, new GeneralMaterial(500, vec3(1, 1, 1), 1, 0)));
 
+			objects.push_back(new Sphere(vec3(-1.5, -1.5, 1), 1.2, new GeneralMaterial(500, vec3(1, 0, 0), 1, 0)));
+			objects.push_back(new Sphere(vec3(1.5, -1.5, 1), 1.2, new GeneralMaterial(500, vec3(0, 1, 0), 1, 0)));
+			objects.push_back(new Sphere(vec3(0, -1.5, -1), 1.2, new GeneralMaterial(500, vec3(0, 0, 1), 1, 0)));
+			objects.push_back(new Sphere(vec3(0, 1, 1), 1.2, new GeneralMaterial(500, vec3(1, 1, 0), 1, 0)));
+
+			for (auto& i : objects) {
+				i->power = 0;
+			}
 		} else {
-			objects.push_back(new Rect(vec3(0, -4, +2), eyePos, lightCenterPos, 4, 1, new TableMaterial(500)));
-			objects.push_back(new Rect(vec3(0, -3.5, -2), eyePos, lightCenterPos, 4, 1, new TableMaterial(1000)));
-			objects.push_back(new Rect(vec3(0, -2.5, -6), eyePos, lightCenterPos, 4, 1, new TableMaterial(5000)));
-			objects.push_back(new Rect(vec3(0, -1, -10), eyePos, lightCenterPos, 4, 1, new TableMaterial(10000)));
+			// Create geometry - 4 rectangles
+			bool sameShininies = false;
+			if (sameShininies == true) {
+				objects.push_back(new Rect(vec3(0, -4, +2), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
+				objects.push_back(new Rect(vec3(0, -3.5, -2), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
+				objects.push_back(new Rect(vec3(0, -2.5, -6), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
+				objects.push_back(new Rect(vec3(0, -1, -10), eyePos, lightCenterPos, 4, 1, new TableMaterial(800)));
+
+			}
+			else {
+				objects.push_back(new Rect(vec3(0, -4, +2), eyePos, lightCenterPos, 4, 1, new TableMaterial(500)));
+				objects.push_back(new Rect(vec3(0, -3.5, -2), eyePos, lightCenterPos, 4, 1, new TableMaterial(1000)));
+				objects.push_back(new Rect(vec3(0, -2.5, -6), eyePos, lightCenterPos, 4, 1, new TableMaterial(5000)));
+				objects.push_back(new Rect(vec3(0, -1, -10), eyePos, lightCenterPos, 4, 1, new TableMaterial(10000)));
+			}
+
+			// Create 4 light sources
+			objects.push_back(new Sphere(lightCenterPos + vec3(-4.5, 0, 0), 0.07, new LightMaterial(vec3(4, 2, 1))));
+			objects.push_back(new Sphere(lightCenterPos + vec3(-1.5, 0, 0), 0.16, new LightMaterial(vec3(2, 4, 1))));
+			objects.push_back(new Sphere(lightCenterPos + vec3(1.5, 0, 0), 0.4, new LightMaterial(vec3(2, 1, 4))));
+			objects.push_back(new Sphere(lightCenterPos + vec3(4.5, 0, 0), 1, new LightMaterial(vec3(4, 1, 2))));
 		}
-		
-		// Create 4 light sources
-		objects.push_back(new Sphere(lightCenterPos + vec3(-4.5, 0, 0), 0.07, new LightMaterial(vec3(4, 2, 1))));
-		objects.push_back(new Sphere(lightCenterPos + vec3(-1.5, 0, 0), 0.16, new LightMaterial(vec3(2, 4, 1))));
-		objects.push_back(new Sphere(lightCenterPos + vec3(1.5, 0, 0), 0.4, new LightMaterial(vec3(2, 1, 4))));
-		objects.push_back(new Sphere(lightCenterPos + vec3(4.5, 0, 0), 1, new LightMaterial(vec3(4, 1, 2))));
+
 
 		// Set the camera
 		camera.set(eyePos, vec3(0, 0, 0), vec3(0, 1, 0), 35.0 * M_PI / 180.0);
 
 		totalPower = 0;
 		for (int i = 0; i < objects.size(); i++) {
-			totalPower += objects[i]->power; //  hit.t < 0 if no intersection
+			totalPower += objects[i]->power;
 		}
 	}
 
@@ -831,6 +853,13 @@ public:
 			errorFile = fopen("BRDF.txt", "w");
 			setWeight(0.0);
 			break;
+		case PATH_TRACING:
+		case MIS:
+			nBRDFSamples = nTotalSamples / 2;
+			nLightSamples = nTotalSamples / 2;
+			errorFile = fopen("MIS.txt", "w");
+			setWeight(0.5);
+			break;
 		case NAIVE:
 		case LIGHT_SOURCE_ENV:
 		case LIGHT_SOURCE:
@@ -848,7 +877,7 @@ public:
 			double error = 0;
 			for (int Y = 0; Y < screenHeight; Y++) { // for all rows
 
-				#pragma omp parallel for
+				#pragma omp parallel for schedule(dynamic)
 				for (int X = 0; X < screenWidth; X++) { // for all pixels in a row
 					//if (debug) { // debug particular pixel x,y, coordinates from pfsv (pfstools)
 					//	X = 287;
@@ -863,6 +892,10 @@ public:
 					vec3 color;
 					if (method == NAIVE) {
 						color = traceNaive(camera.getRay(X, Y));
+					} else if (method == MIS) {
+						color = traceMIS(camera.getRay(X, Y));
+					} else if (method == PATH_TRACING) {
+						color = pathTrace(camera.getRay(X, Y));
 					} else {
 						color = trace2(camera.getRay(X, Y));
 					}
@@ -888,7 +921,7 @@ public:
 		Hit bestHit;
 		for (int i = 0; i < objects.size(); i++) {
 			if (objects[i] == skip) continue;
-			if (method == LIGHT_SOURCE_ENV || method == BRDF || method == NAIVE) {
+			if (method == LIGHT_SOURCE_ENV || method == BRDF_ENV || method == NAIVE) {
 				if (i >= 4 && i <= 7) {
 					continue;
 				}
@@ -921,13 +954,10 @@ public:
 	}
 
 	Light& sampleLight(vec3& point, vec3& direction) {
-		if (method == LIGHT_SOURCE) {
+		if (method == LIGHT_SOURCE || method == MIS) {
 			SphereLight* lightSample = sampleLightSource(point); // generate a light sample
-
 			vec3 outDir = lightSample->point - point; // compute direction towards sample
-
 			direction = outDir;
-
 			return *lightSample;
 		} else {
 			// return env map
@@ -942,11 +972,11 @@ public:
 		// error measures for the two combined techniques: used for adaptation
 		Hit hit = firstIntersect(r, NULL);	// find visible point
 		if (hit.t < 0) {
-			//if (method == LIGHT_SOURCE_ENV) {
+			if (method == LIGHT_SOURCE_ENV) {
 				return envMap.sampleMapFromDirection(r.dir, vec3(0,1,0));
-			//} else {
-			//	return vec3(0, 0, 0);
-			//}
+			} else {
+				return vec3(0, 0, 0);
+			}
 		}
 
 		// The energy emanated from the material
@@ -976,7 +1006,115 @@ public:
 
 			outDir = outDir.normalize();
 
-			//vec3 col = lightSample.getIlumination(outDir);
+			double cosThetaLight = dot(lightSample.normal, outDir * (-1));
+			if (cosThetaLight > epsilon) {
+				// visibility is not needed to handle, all lights are visible
+				double pdfLightSourceSampling = lightSample.sampleProbability(hit.position, outDir, totalPower) * distance2 / cosThetaLight;
+				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
+
+				// the theta angle on the surface between normal and light direction
+				double cosThetaSurface = dot(hit.normal, outDir);
+				if (cosThetaSurface > 0) {
+					// yes, the light is visible and contributes to the output power
+					// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
+					vec3 f = lightSample.getIlumination(outDir) * hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
+
+					// importance sample = 1/n . \sum (f/prob)
+					radianceLightSourceSampling += f / pdfLightSourceSampling / nTotalSamples;
+				} // if
+			}
+		} // for all the samples from light
+
+		// The contribution from importance sampling BRDF.cos(theta)
+		for (int i = 0; i < nBRDFSamples; i++) {
+			vec3 outDir;
+
+			// BRDF sampling with Russian roulette
+			if (hit.material->sampleDirection(hit.normal, inDir, outDir, REFL_TYPE_PLACEHOLDER)) {
+				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
+				double cosThetaSurface = dot(hit.normal, outDir);
+
+				if (cosThetaSurface > 0) {
+					vec3 brdf = hit.material->BRDF(hit.normal, inDir, outDir);
+
+					if (method == BRDF_ENV) {
+						vec3 Le = envMap.getIlumination(outDir);
+
+						if (Le.average() > 0) {
+							double cosThetaLight = dot(outDir * (-1), outDir * (-1));
+
+							if (cosThetaLight > epsilon) {
+								double pdfLightSourceSampling = envMap.sampleProbability(hit.position, outDir, totalPower) / cosThetaLight;
+
+								// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
+								vec3 f = Le * brdf * cosThetaSurface;
+								radianceBRDFSampling += f / pdfBRDFSampling / nTotalSamples;
+							} else {
+								printf("ERROR: Sphere hit from back\n");
+							}
+						}
+					} else {
+						// Trace a ray to the scene
+						Hit lightSource = firstIntersect(Ray(hit.position, outDir), hit.object);
+					
+						// Do we hit a light source
+						if (lightSource.t > 0 && lightSource.material->Le.average() > 0) {
+							// squared distance between an illuminated point and light source
+							double distance2 = lightSource.t * lightSource.t;
+							double cosThetaLight = dot(lightSource.normal, outDir * (-1));
+
+							if (cosThetaLight > epsilon) {
+								double pdfLightSourceSampling = lightSource.object->pointSampleProb(totalPower) * distance2 / cosThetaLight;
+
+								// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
+								vec3 f = lightSource.material->Le * brdf * cosThetaSurface;
+								radianceBRDFSampling += f / pdfBRDFSampling / nTotalSamples;
+							} else {
+								printf("ERROR: Sphere hit from back\n");
+							}
+						}
+
+					}
+				}
+			}
+		} // for i
+		return radianceEmitted + radianceLightSourceSampling + radianceBRDFSampling;
+	}
+
+	vec3 traceMIS(const Ray& r)
+	{
+		Hit hit = firstIntersect(r, NULL);
+		if (hit.t < 0) {
+			return vec3(0, 0, 0);
+			//return envMap.sampleMapFromDirection(r.dir, vec3(0, 1, 0));
+		}
+
+		// The energy emanated from the material
+		vec3 radianceEmitted = hit.material->Le;
+
+		if (hit.material->diffuseAlbedo.average() < epsilon && hit.material->specularAlbedo.average() < epsilon) {
+			return radianceEmitted; // if albedo is low, no energy can be reefleted
+		}
+
+		// Compute the contribution of reflected lgiht
+		vec3 radianceBRDFSampling(0, 0, 0);
+		vec3 radianceLightSourceSampling(0, 0, 0);
+		vec3 inDir = r.dir * (-1);	// incident direction
+
+		int nTotalSamples = (nLightSamples + nBRDFSamples);
+		double alpha = (double)nLightSamples / nTotalSamples;
+
+		// The direct illumination for chosen number of samples
+		for (int i = 0; i < nLightSamples; i++) {
+			vec3 outDir = vec3(0, 0, 0);
+			Light& lightSample = sampleLight(hit.position, outDir);
+
+			double distance2 = dot(outDir, outDir);
+			if (sqrt(distance2) < epsilon) {
+				continue;
+			}
+
+			outDir = outDir.normalize();
 
 			double cosThetaLight = dot(lightSample.normal, outDir * (-1));
 
@@ -988,13 +1126,11 @@ public:
 				// the theta angle on the surface between normal and light direction
 				double cosThetaSurface = dot(hit.normal, outDir);
 				if (cosThetaSurface > 0) {
-					// yes, the light is visible and contributes to the output power
-					// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
 
 					vec3 f = lightSample.getIlumination(outDir) * hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
+					double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
+					double p = pdfLightSourceSampling + pdfBRDFSampling;
 
-					double p = pdfLightSourceSampling;
-					// importance sample = 1/n . \sum (f/prob)
 					radianceLightSourceSampling += f / p / nTotalSamples;
 				} // if
 			}
@@ -1002,11 +1138,10 @@ public:
 
 		// The contribution from importance sampling BRDF.cos(theta)
 		for (int i = 0; i < nBRDFSamples; i++) {
-			// BRDF.cos(theta) sampling should be implemented first!
 			vec3 outDir;
 
 			// BRDF sampling with Russian roulette
-			if (hit.material->sampleDirection(hit.normal, inDir, outDir)) {
+			if (hit.material->sampleDirection(hit.normal, inDir, outDir, REFL_TYPE_PLACEHOLDER)) {
 				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
 				double cosThetaSurface = dot(hit.normal, outDir);
 
@@ -1014,45 +1149,38 @@ public:
 					vec3 brdf = hit.material->BRDF(hit.normal, inDir, outDir);
 
 					// Trace a ray to the scene
-					//Hit lightSource = firstIntersect(Ray(hit.position, outDir), hit.object);
-					vec3 Le = envMap.getIlumination(outDir);
+					Hit lightSource = firstIntersect(Ray(hit.position, outDir), hit.object);
 
 					// Do we hit a light source
-					//if (lightSource.t > 0 && lightSource.material->Le.average() > 0) {
-					if (Le.average() > 0) {
+					if (lightSource.t > 0 && lightSource.material->Le.average() > 0) {
 						// squared distance between an illuminated point and light source
-						//double distance2 = lightSource.t * lightSource.t;
-						//double cosThetaLight = dot(lightSource.normal, outDir * (-1));
-						double cosThetaLight = dot(outDir * (-1), outDir * (-1));
+						double distance2 = lightSource.t * lightSource.t;
+						double cosThetaLight = dot(lightSource.normal, outDir * (-1));
 
 						if (cosThetaLight > epsilon) {
-							//double pdfLightSourceSampling = lightSource.object->pointSampleProb(totalPower) * distance2 / cosThetaLight;
-							double pdfLightSourceSampling = envMap.sampleProbability(hit.position, outDir, totalPower) / cosThetaLight;
-
 							// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
-							//vec3 f = lightSource.material->Le * brdf * cosThetaSurface;
-							vec3 f = Le * brdf * cosThetaSurface;
-							double p = pdfBRDFSampling;
+							vec3 f = lightSource.material->Le * brdf * cosThetaSurface;
+							
+							double pdfLightSourceSampling = lightSource.object->pointSampleProb(totalPower) * distance2 / cosThetaLight;
+							double p = pdfBRDFSampling + pdfLightSourceSampling;
 							radianceBRDFSampling += f / p / nTotalSamples;
 						}
-						else
-							printf("ERROR: Sphere hit from back\n");
 					}
 				}
 			}
 		} // for i
+
 		return radianceEmitted + radianceLightSourceSampling + radianceBRDFSampling;
 	}
 
 	vec3 traceNaive(const Ray& r)
 	{
-		// error measures for the two combined techniques: used for adaptation
-		Hit hit = firstIntersect(r, NULL);	// find visible point
+		Hit hit = firstIntersect(r, NULL);
 		if (hit.t < 0) {
 			return envMap.sampleMapFromDirection(r.dir, vec3(0, 1, 0));
 		}
 
-		// The energy emanated from the material
+		// The energy emited from the material
 		vec3 radianceEmitted = hit.material->Le;
 
 		if (hit.material->diffuseAlbedo.average() < epsilon && hit.material->specularAlbedo.average() < epsilon) {
@@ -1083,34 +1211,25 @@ public:
 
 			double cosThetaLight = dot(envMap.normal, outDir * (-1));
 			if (cosThetaLight > epsilon) {
-				// visibility is not needed to handle, all lights are visible
 				double pdfLightSourceSampling = pdf;
 				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
 
-				// the theta angle on the surface between normal and light direction
 				double cosThetaSurface = dot(hit.normal, outDir * (-1.f));
 				if (cosThetaSurface > 0) {
-					// yes, the light is visible and contributes to the output power
-					// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
-
 					vec3 f = envMap.getIlumination(outDir) * hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
-
-					//std::cout << f.x << " " << f.y << " " << f.z << std::endl;
-
+					
 					double p = pdfLightSourceSampling;
-					// importance sample = 1/n . \sum (f/prob)
 					radianceLightSourceSampling += f / p / nTotalSamples;
-				} // if
+				}
 			}
-		} // for all the samples from light
+		}
 
 		// The contribution from importance sampling BRDF.cos(theta)
 		for (int i = 0; i < nBRDFSamples; i++) {
-			// BRDF.cos(theta) sampling should be implemented first!
 			vec3 outDir;
 
 			// BRDF sampling with Russian roulette
-			if (hit.material->sampleDirection(hit.normal, inDir, outDir)) {
+			if (hit.material->sampleDirection(hit.normal, inDir, outDir, REFL_TYPE_PLACEHOLDER)) {
 				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
 				double cosThetaSurface = dot(hit.normal, outDir);
 
@@ -1120,11 +1239,6 @@ public:
 					// Trace a ray to the scene
 					Hit lightSource = firstIntersect(Ray(hit.position, outDir), hit.object);
 
-					/*if (hit.t < 0) {
-						radianceBRDFSampling += envMap.getIlumination(outDir) / envMap.pdf(hit.position, outDir) / nTotalSamples;
-						continue;
-					}*/
-
 					// Do we hit a light source
 					if (lightSource.t > 0 && lightSource.material->Le.average() > 0) {
 						// squared distance between an illuminated point and light source
@@ -1132,32 +1246,109 @@ public:
 						double cosThetaLight = dot(lightSource.normal, outDir * (-1));
 
 						if (cosThetaLight > epsilon) {
-							double pdfLightSourceSampling = lightSource.object->pointSampleProb(totalPower) * distance2 / cosThetaLight;
-
-							// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
 							vec3 f = lightSource.material->Le * brdf * cosThetaSurface;
+
+							double pdfLightSourceSampling = lightSource.object->pointSampleProb(totalPower) * distance2 / cosThetaLight;
 							double p = pdfBRDFSampling;
 							radianceBRDFSampling += f / p / nTotalSamples;
 						}
-						else
-							printf("ERROR: Sphere hit from back\n");
 					}
 				}
 			}
-		} // for i
+		}
+
 		return radianceEmitted + radianceLightSourceSampling + radianceBRDFSampling;
 	}
 
+	vec3 castRay(const Ray& r, int depth, int type) {
+		if (depth > 50) {
+			return vec3(0.0f, 0.0f, 0.0f);
+		}
+
+		vec3 L = vec3();
+
+		// find intersection in scene
+		Hit hit = firstIntersect(r, NULL);	
+		if (hit.t < 0) {
+			// No hit at first / specular reflection - return env map
+			if (depth == 0 || type == REFL_SPEC) {
+				return envMap.sampleMapFromDirection(r.dir, vec3(0, 1, 0));
+			} else {
+				return vec3();
+			}
+			
+		}
+
+		// Material is emmisive and first hit or specular
+		if ((depth == 0 || type == REFL_SPEC) && hit.material->Le.average() > 0.0) {
+			L += hit.material->Le;
+		}
+
+		// Direct light contribution
+		vec3 directLight = vec3();
+		vec3 inDir = r.dir * -1.0f;
+		vec3 outDir = vec3(0, 0, 0);
+		Light& lightSample = sampleLight(hit.position, outDir);
+
+		double distance2 = dot(outDir, outDir);
+		outDir = outDir.normalize();
+
+		double cosThetaLight = dot(lightSample.normal, outDir * (-1));
+
+		if (cosThetaLight > epsilon) {
+			double pdfLightSourceSampling = lightSample.sampleProbability(hit.position, outDir, totalPower) * distance2 / cosThetaLight;
+			double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir);
+
+			Ray lightRay = Ray(hit.position, outDir);
+			Hit lightHit = firstIntersect(lightRay, NULL);
+			bool visibility = lightHit.t < 0 ? 1 : 0;
+
+			if (visibility) {
+				double cosThetaSurface = dot(hit.normal, outDir);
+				if (cosThetaSurface > 0) {
+					vec3 f = lightSample.getIlumination(outDir) * hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
+					directLight += f / pdfLightSourceSampling;
+				}
+			}
+		}
+
+		vec3 indirectLighting = vec3();
+
+		vec3 wi = vec3();
+		int reflectionType = -1;
+		hit.material->sampleDirection(hit.normal, inDir, wi, type);
+		double pdf = hit.material->sampleProb(hit.normal, inDir, wi);
+	
+		double albedo = (hit.material->diffuseAlbedo + hit.material->specularAlbedo).average();
+
+		if (drandom() >  albedo) {
+			return directLight + indirectLighting;
+		}
+
+		indirectLighting = castRay(Ray(hit.position, wi), depth + 1, type) / albedo;
+
+		return directLight + indirectLighting;
+	}
+
+	vec3 pathTrace(const Ray& r)
+	{
+		vec3 radiance = vec3(0, 0, 0);
+		int pixelSamples = 64;
+		for (int i = 0; i < pixelSamples; i++) {
+			radiance += castRay(r, 0, 0);
+		}
+
+		return radiance / pixelSamples;
+	}
 
 	// Trace a primary ray towards the scene
-	/*
-	vec3 trace(const Ray& r)
+	vec3 trace(const Ray& r) 
 	{
 		// error measures for the two combined techniques: used for adaptation
 		Hit hit = firstIntersect(r, NULL);	// find visible point
 		if (hit.t < 0) {
 			if (method == LIGHT_SOURCE_ENV) {
-				return envMap.sampleMapFromDirection(r.dir);
+				return envMap.sampleMapFromDirection(r.dir, vec3(0, 1, 0));
 			} else {
 				return vec3(0, 0, 0);
 			}
@@ -1207,20 +1398,18 @@ public:
 					// yes, the light is visible and contributes to the output power
 					// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
 					vec3 f = lightSample.sphere->material->Le * hit.material->BRDF(hit.normal, inDir, outDir) * cosThetaSurface;
-					double p = pdfLightSourceSampling;
 					// importance sample = 1/n . \sum (f/prob)
-					radianceLightSourceSampling += f / p / nTotalSamples;
+					radianceLightSourceSampling += f / pdfLightSourceSampling / nTotalSamples;
 				} // if
 			}
 		} // for all the samples from light
 
 		// The contribution from importance sampling BRDF.cos(theta)
 		for (int i = 0; i < nBRDFSamples; i++) {
-			// BRDF.cos(theta) sampling should be implemented first!
 			vec3 outDir;
 
 			// BRDF sampling with Russian roulette
-			if (hit.material->sampleDirection(hit.normal, inDir, outDir)) {
+			if (hit.material->sampleDirection(hit.normal, inDir, outDir, REFL_TYPE_PLACEHOLDER)) {
 				double pdfBRDFSampling = hit.material->sampleProb(hit.normal, inDir, outDir); 
 				double cosThetaSurface = dot(hit.normal, outDir);
 				
@@ -1241,8 +1430,7 @@ public:
 							
 							// The evaluation of rendering equation locally: (light power) * brdf * cos(theta)
 							vec3 f = lightSource.material->Le * brdf * cosThetaSurface;
-							double p = pdfBRDFSampling;
-							radianceBRDFSampling += f / p / nTotalSamples;
+							radianceBRDFSampling += f / pdfBRDFSampling / nTotalSamples;
 						} else
 							printf("ERROR: Sphere hit from back\n");
 					}
@@ -1251,7 +1439,6 @@ public:
 		} // for i
 		return radianceEmitted + radianceLightSourceSampling + radianceBRDFSampling;
 	}
-	*/
 
 	// Only testing routine for debugging
 	void testRay(int X, int Y)
@@ -1425,9 +1612,16 @@ void Usage()
 {
 	printf("Usage:\n");
 	printf(" 'b': BRDF sampling \n");
-	printf(" 'l': light source sampling \n");
+	printf(" 'B': BRDF sampling with environment map as light\n");
+	printf(" 'l': Light source sampling \n");
+	printf(" 'e': Light source sampling with environment map as light\n");
+	printf(" 'n': Naive environment map sampling\n");
+	printf(" 'm': Multiple importance sampling (50:50)\n");
+	printf(" 'p': Path tracing with russian roulette\n");
 	printf(" 'r': Show reference\n");
 	printf(" 'w': Print current as a ground truth reference file for the future\n");
+	printf(" 'h': Test of HDR load + conversion to luminance + importance sampling test\n");
+	printf(" 'd': Create debug HDR with one bright area\n");
 	printf(" 'o': Write output HDR file of rendered image\n\n");
 	printf(" 'O': Write output HDR file render+pseudocolor visualization\n\n");
 }
@@ -1449,7 +1643,6 @@ void onKeyboard(unsigned char key, int x, int y)
 	{
 		printf("Try to load HDR image\n");
 
-	
 		InfiniteAreaLight light = InfiniteAreaLight("./EM/raw015.hdr");
 		vec3 wi; float pdf;
 		float u;
@@ -1470,12 +1663,8 @@ void onKeyboard(unsigned char key, int x, int y)
 		}
 
 		// save HDR map
-		stbi_write_hdr("swag.hdr", light.nu, light.nv, 3, light.img);
-
-
-		stbi_write_hdr("swagLumi.hdr", light.nu, light.nv, 1, light.luminanceImg);
-
-
+		stbi_write_hdr("hdrTest.hdr", light.nu, light.nv, 3, light.img);
+		stbi_write_hdr("hdrTestLuminance.hdr", light.nu, light.nv, 1, light.luminanceImg);
 		break;
 	}
 	case 'd':
@@ -1508,31 +1697,40 @@ void onKeyboard(unsigned char key, int x, int y)
 
 		break;
 	}
+	case 'p':
+		method = PATH_TRACING;
+		printf("Path tracing\n");
+		scene.render();
+		break;
 	case 'l':
 		method = LIGHT_SOURCE;
 		printf("Light source sampling\n");
+		scene.render();
+		break;
+	case 'm':
+		method = MIS;
+		printf("Multiple importance sampling\n");
 		scene.render();
 		break;
 	case 'e':
 		method = LIGHT_SOURCE_ENV;
 		printf("ENV map sampling\n");
 		scene.render();
-		
-		//stbi_write_hdr("swag.hdr", scene.envMap.nu, scene.envMap.nv, 3, scene.envMap.img);
-
 		break;
 	case 'b':
 		method = BRDF;
 		printf("BRDF sampling\n");
 		scene.render();
 		break;
+	case 'B':
+		method = BRDF_ENV;
+		printf("BRDF sampling of envMap");
+		scene.render();
+		break;
 	case 'n':
 		method = NAIVE;
 		printf("Naive env map render\n");
 		scene.render();
-
-		stbi_write_hdr("swag.hdr", scene.envMap.nu, scene.envMap.nv, 3, scene.envMap.img);
-
 		break;
 	case 'w':
 	{
@@ -1548,12 +1746,16 @@ void onKeyboard(unsigned char key, int x, int y)
 	{
 		printf("Writing output HDR file (extension .hdr)\n");
 		FILE* fp = nullptr;
+
 		switch (method) {
-		case LIGHT_SOURCE: fp = fopen("lightsource.hdr", "wb"); break;
-		case BRDF: fp = fopen("brdf.hdr", "wb"); break;
-		case LIGHT_SOURCE_ENV: fp = fopen("lightsourceEnv.hdr", "wb"); break;
-		case NAIVE: fp = fopen("naive.hdr", "wb"); break;
+			case LIGHT_SOURCE: fp = fopen("lightsource.hdr", "wb"); break;
+			case BRDF: fp = fopen("brdf.hdr", "wb"); break;
+			case LIGHT_SOURCE_ENV: fp = fopen("lightsourceEnv.hdr", "wb"); break;
+			case NAIVE: fp = fopen("naive.hdr", "wb"); break;
+			case MIS: fp = fopen("mis.hdr", "wb"); break;
+			case PATH_TRACING: fp = fopen("pt.hdr", "wb"); break;
 		}
+
 		int width = screenWidth;
 		bool psf = false;
 		if (key == 'O') { width *= 2;psf = true; }
@@ -1564,7 +1766,7 @@ void onKeyboard(unsigned char key, int x, int y)
 			for (int ii = 0; ii < nmemb; ii++) {
 				RGBE& rgbe = data[ii];
 				int x = (ii % width);
-				int y = screenHeight - (ii / width) + 1;
+				int y = screenHeight - (ii / width) - 1;
 				vec3 vv;
 				assert(image);
 				vv = image[y * screenWidth + x];
