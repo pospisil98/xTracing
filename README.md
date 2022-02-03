@@ -1,6 +1,9 @@
 # xTracing
 Ray / Path tracing bundle for semestral work of Realistic Image Synthesis subject(RSO) at FEE CTU
 
+# TODOs:
+- [ ] clean up code (it is messy because of tight deadline)
+
 # Sample renders
 
 ### BRDF sampling
